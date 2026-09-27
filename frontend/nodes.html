@@ -183,13 +183,14 @@ async function showBlocks(node) {
 async function loadMatrix() {
   const d = await api("GET", "/api/nodes/matrix?limit=80");
   matrixData = d;
+  const violations = d.rows.filter(r => r.rack_violation).length;
   document.getElementById("matrix-hint").textContent =
-    `共 ${d.total_blocks} 块，展示 ${d.rows.length}`;
+    `共 ${d.total_blocks} 块，展示 ${d.rows.length}，本页机架堆叠 ${violations} 块`;
   const box = document.getElementById("matrix-box");
   box.innerHTML = `
     <table class="matrix">
       <thead><tr><th style="text-align:left">块</th><th>大小</th><th>副本</th>
-        ${d.nodes.map(n => `<th>${esc(n)}</th>`).join("")}<th>状态</th><th></th></tr></thead>
+        ${d.nodes.map(n => `<th><div>${esc(n)}</div><div class="small muted">${esc((d.node_racks || {})[n] || "")}</div></th>`).join("")}<th>状态</th><th></th></tr></thead>
       <tbody>
         ${d.rows.map((r, ri) => `
           <tr>
@@ -204,6 +205,7 @@ async function loadMatrix() {
                         title="${esc(n)}: ${esc(c)}">${glyph}</td>`;
             }).join("")}
             <td>${r.status === "ok" ? '<span class="badge ok plain">健康</span>' :
+                  r.status === "rack_violation" ? '<span class="badge warn plain">机架堆叠</span>' :
                   r.status === "under" ? '<span class="badge warn plain">欠副本</span>' :
                   '<span class="badge bad plain">丢失</span>'}</td>
             <td><button class="btn xs ghost m-paths" data-b="${esc(r.block)}">引用</button></td>
@@ -240,6 +242,8 @@ async function loadQueue() {
     <div class="small" style="margin-bottom:8px">
       <span class="badge ${under.length ? "warn" : "ok"}">欠副本 ${q.counts.under}</span>
       <span class="badge ${corrupt.length ? "bad" : "ok"}">损坏 ${q.counts.corrupt}</span>
+      <span class="badge ${q.counts.rack_violations ? "warn" : "ok"}">机架堆叠 ${q.counts.rack_violations || 0}</span>
+      <span class="badge ${q.counts.rack_rebalancing ? "acc" : "dim"}">机架迁移 ${q.counts.rack_rebalancing || 0}</span>
       <span class="badge ${q.counts.missing ? "bad" : "ok"}">丢失 ${q.counts.missing}</span>
       <span class="badge ${q.counts.scheduled ? "acc" : "dim"}">调度中 ${q.counts.scheduled}</span>
     </div>

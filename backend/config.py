@@ -70,7 +70,7 @@ MIN_REPLICATION = 2                    # 低于该值触发紧急恢复
 MAX_REPLICATION = 4
 REPLICATION_TIMEOUT = 30.0             # 副本复制命令超时（秒），超时重排
 GENSTAMP_INITIAL = 1                   # 块版本号（generation stamp）初始值
-RECOVERY_TRIGGER = "min"               # 恢复队列触发口径
+RECOVERY_TRIGGER = "desired"           # 存活好副本低于期望副本数即进入恢复队列
 
 # ----------------------------------------------------------------------------
 # 心跳 / 汇报 / 巡检 / 恢复（难点二：故障检测与自动恢复）
@@ -81,6 +81,8 @@ BLOCK_REPORT_INTERVAL = 5.0            # 全量块汇报间隔（秒）
 SCRUB_INTERVAL = 6.0                   # 数据巡检（校验和扫描）间隔（秒）
 SCRUB_BATCH = 24                       # 每次巡检最多校验的块数
 RECOVERY_SCAN_INTERVAL = 2.0           # 恢复调度线程扫描间隔（秒）
+RACK_REBALANCE_SCAN_INTERVAL = 3.0     # 机架再均衡扫描间隔（秒）
+RACK_REBALANCE_MAX_MOVES = 16          # 单轮最多迁移的副本数，防止瞬间放大网络流量
 GC_INTERVAL = 20.0                     # 垃圾块回收扫描间隔（秒）
 GC_GRACE_SECONDS = 45.0                # 未被引用的块保留宽限期（秒）
 STATS_INTERVAL = 15.0                  # 容量历史采样间隔（秒）
