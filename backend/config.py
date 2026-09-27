@@ -70,7 +70,7 @@ MIN_REPLICATION = 2                    # 低于该值触发紧急恢复
 MAX_REPLICATION = 4
 REPLICATION_TIMEOUT = 30.0             # 副本复制命令超时（秒），超时重排
 GENSTAMP_INITIAL = 1                   # 块版本号（generation stamp）初始值
-RECOVERY_TRIGGER = "min"               # 恢复队列触发口径
+RECOVERY_TRIGGER = "desired"          # 恢复队列触发口径：低于期望副本数即恢复
 
 # ----------------------------------------------------------------------------
 # 心跳 / 汇报 / 巡检 / 恢复（难点二：故障检测与自动恢复）

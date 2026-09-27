@@ -564,7 +564,7 @@ def api_version_stats(ctx):
 def api_nodes(ctx):
     data = ctx.nn.nodes_view()
     matrix = ctx.nn.replica_matrix(limit=1000)
-    data["health"]["under_replicated"] = sum(
+    data["health"]["unhealthy_blocks"] = sum(
         1 for r in matrix["rows"] if r["status"] != "ok")
     return data
 

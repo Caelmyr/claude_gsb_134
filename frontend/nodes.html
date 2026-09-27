@@ -96,6 +96,7 @@ function renderSummary(d) {
   const cells = [
     { label: "节点", value: `${d.summary.live}/${d.summary.total}`, sub: `DEAD ${d.summary.dead} · SUSPECT ${d.summary.suspect}`, cls: d.summary.dead ? "bad" : "ok" },
     { label: "欠副本块", value: h.under_replicated, sub: "低于期望副本数", cls: h.under_replicated ? "warn" : "ok" },
+    { label: "机架违规块", value: h.rack_violations || 0, sub: "满副本但未跨机架摊开", cls: h.rack_violations ? "warn" : "ok" },
     { label: "损坏副本", value: h.corrupt_replicas, sub: "校验和不匹配", cls: h.corrupt_replicas ? "bad" : "ok" },
     { label: "丢失块", value: h.missing_blocks, sub: "无任何可用副本", cls: h.missing_blocks ? "bad" : "ok" },
     { label: "调度中", value: h.scheduled, sub: "已下发复制命令", cls: h.scheduled ? "accent" : "" },
@@ -205,6 +206,7 @@ async function loadMatrix() {
             }).join("")}
             <td>${r.status === "ok" ? '<span class="badge ok plain">健康</span>' :
                   r.status === "under" ? '<span class="badge warn plain">欠副本</span>' :
+                  r.status === "rack_violation" ? '<span class="badge warn plain">机架违规</span>' :
                   '<span class="badge bad plain">丢失</span>'}</td>
             <td><button class="btn xs ghost m-paths" data-b="${esc(r.block)}">引用</button></td>
           </tr>`).join("")}
@@ -235,10 +237,13 @@ async function loadQueue() {
   const q = await api("GET", "/api/health/queue");
   const box = document.getElementById("queue-box");
   const under = q.under_replicated;
+  const rack = q.rack_violations || [];
   const corrupt = Object.entries(q.corrupt);
   box.innerHTML = `
     <div class="small" style="margin-bottom:8px">
       <span class="badge ${under.length ? "warn" : "ok"}">欠副本 ${q.counts.under}</span>
+      <span class="badge ${rack.length ? "warn" : "ok"}">机架违规 ${q.counts.rack_violations || rack.length}</span>
+      <span class="badge ${q.counts.rack_adjusting ? "acc" : "dim"}">机架再均衡 ${q.counts.rack_adjusting || 0}</span>
       <span class="badge ${corrupt.length ? "bad" : "ok"}">损坏 ${q.counts.corrupt}</span>
       <span class="badge ${q.counts.missing ? "bad" : "ok"}">丢失 ${q.counts.missing}</span>
       <span class="badge ${q.counts.scheduled ? "acc" : "dim"}">调度中 ${q.counts.scheduled}</span>
@@ -255,6 +260,16 @@ async function loadQueue() {
         <td class="num">${u.attempts}</td>
         <td class="small mono">${u.scheduled ? `${esc(u.scheduled.src)} → ${esc((u.scheduled.dst || []).join(","))}` : '<span class="muted">待调度</span>'}</td>
       </tr>`).join("")}</tbody></table></div>` : '<div class="empty small">队列清空：所有块副本齐全 🎉</div>'}
+    ${rack.length ? `
+    <div class="table-wrap scroll-y" style="max-height:180px;margin-top:10px">
+    <table class="tbl"><thead><tr><th>块</th><th>机架分布</th><th>副本</th><th>再均衡</th></tr></thead>
+    <tbody>${rack.map(r => `
+      <tr>
+        <td class="mono small">${esc(r.block.slice(-10))}</td>
+        <td class="small">${esc(Object.entries(r.racks || {}).map(([rack, n]) => `${rack}:${n}`).join(" · "))} <span class="muted">（需 ≥ ${r.needed_racks} 机架）</span></td>
+        <td><span class="badge warn plain">${r.live}/${r.desired}</span></td>
+        <td class="small mono">${r.adjustment ? `${esc(r.adjustment.src)} → ${esc(r.adjustment.dst)} (${esc(r.adjustment.phase)})` : '<span class="muted">等待调度</span>'}</td>
+      </tr>`).join("")}</tbody></table></div>` : ""}
     ${corrupt.length ? `<div class="small" style="margin-top:10px">
       ${corrupt.map(([k, v]) => `<span class="badge bad plain" title="${esc(v.reason || "")} · ${fmtTs(v.ts)}">${esc(k.slice(-16))}</span>`).join(" ")}</div>` : ""}`;
 }

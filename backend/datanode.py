@@ -313,7 +313,8 @@ class DataNode:
             self._persist_state()
         return existed
 
-    def replicate_from(self, bid, src_url, genstamp, checksum, size=None):
+    def replicate_from(self, bid, src_url, genstamp, checksum, size=None,
+                       migration_id=None):
         """从源节点 HTTP 拉取块并本地落盘（恢复流程的执行端）。"""
         url = f"{src_url.rstrip('/')}/block/{bid}"
         try:
@@ -322,17 +323,20 @@ class DataNode:
                 headers={"X-Cluster-Key": self.cluster_key})
         except HttpError as e:
             self.push_event({"type": "replicate_failed", "block_id": bid,
+                             "migration_id": migration_id,
                              "reason": f"拉取失败: {e}"})
             return False
         try:
             self.store_block(bid, data, genstamp, checksum, size)
         except DataNodeError as e:
             self.push_event({"type": "replicate_failed", "block_id": bid,
+                             "migration_id": migration_id,
                              "reason": str(e)})
             return False
         with self._state_lock:
             self.io["replicate_in"] += 1
         self.push_event({"type": "replicate_done", "block_id": bid,
+                         "migration_id": migration_id,
                          "genstamp": int(genstamp), "checksum": checksum,
                          "size": len(data)})
         return True
@@ -417,7 +421,8 @@ class DataNode:
                 t = threading.Thread(
                     target=self.replicate_from,
                     args=(cmd["block_id"], cmd["src"], cmd.get("genstamp", 1),
-                          cmd.get("checksum"), cmd.get("size")),
+                          cmd.get("checksum"), cmd.get("size"),
+                          cmd.get("migration_id")),
                     name=f"repl-{cmd['block_id'][-6:]}", daemon=True)
                 t.start()
             elif ctype == "delete":
@@ -684,7 +689,7 @@ class DataNodeHandler(BaseHTTPRequestHandler):
                 ok = self.dn.replicate_from(
                     body.get("block_id"), body.get("src_url"),
                     body.get("genstamp", 1), body.get("checksum"),
-                    body.get("size"))
+                    body.get("size"), body.get("migration_id"))
                 return self._send_json({"ok": ok,
                                         "node_id": self.dn.node_id})
             if path == "/corrupt":

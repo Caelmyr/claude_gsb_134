@@ -126,9 +126,9 @@ function renderKpis(ov, nodes) {
       sub: `物理占用 ${fmtBytes(ov.physical_bytes)}（含副本）`, cls: "" },
     { label: "版本提交", value: ov.versions.commits,
       sub: `分支 ${ov.versions.branches} · 合并 ${ov.versions.merge_commits}`, cls: "" },
-    { label: "待处理问题", value: ov.under_replicated + ov.corrupt_replicas + ov.missing_blocks,
-      sub: `欠副本 ${ov.under_replicated} · 损坏 ${ov.corrupt_replicas} · 丢失 ${ov.missing_blocks}`,
-      cls: (ov.under_replicated + ov.corrupt_replicas + ov.missing_blocks) ? "warn" : "ok" },
+    { label: "待处理问题", value: ov.under_replicated + (ov.rack_violations || 0) + ov.corrupt_replicas + ov.missing_blocks,
+      sub: `欠副本 ${ov.under_replicated} · 机架违规 ${ov.rack_violations || 0} · 损坏 ${ov.corrupt_replicas} · 丢失 ${ov.missing_blocks}`,
+      cls: (ov.under_replicated + (ov.rack_violations || 0) + ov.corrupt_replicas + ov.missing_blocks) ? "warn" : "ok" },
   ];
   document.getElementById("kpi-row").innerHTML = kpis.map(k => `
     <div class="kpi ${k.cls}">

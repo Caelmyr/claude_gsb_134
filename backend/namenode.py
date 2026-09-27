@@ -83,6 +83,7 @@ class NameNode:
         self.corrupt_replicas = {}       # (bid, node) -> info
         self.missing_blocks = set()      # 无任何存活好副本
         self.scheduled = {}              # bid -> {"src","dst","at"}
+        self.rack_adjustments = {}       # bid -> {"id","src","dst","phase","at"}
         self.health_lock = threading.RLock()
 
         # ---- 运行态 ----
@@ -356,14 +357,22 @@ class NameNode:
                                          event.get("checksum", blk["checksum"]),
                                          event.get("size", blk["size"]), "ok")
                     self.meta.touch("blocks", flush=False)
+            migration_id = event.get("migration_id")
+            handled_adjustment = self._finish_adjustment_copy(
+                bid, node_id, migration_id)
+            if not handled_adjustment:
+                self.scheduled.pop(bid, None)
             self.check_block_health(bid)
-            self.scheduled.pop(bid, None)
             self.emit("replicate_done",
                       f"块 {short_hash(bid, 12)} 成功复制到 {node_id}",
                       node=node_id, block=bid)
         elif etype == "replicate_failed":
             bid = event.get("block_id")
-            self.scheduled.pop(bid, None)
+            migration_id = event.get("migration_id")
+            handled_adjustment = self._fail_adjustment_copy(
+                bid, node_id, migration_id, event.get("reason", ""))
+            if not handled_adjustment:
+                self.scheduled.pop(bid, None)
             self.check_block_health(bid)
             self.log_event("WARN", "recovery", "replicate_failed",
                            bid or "", "system",
@@ -391,7 +400,8 @@ class NameNode:
                 if blk and node_id in blk.get("replicas", {}):
                     del blk["replicas"][node_id]
                     self.meta.touch("blocks", flush=False)
-            self.check_block_health(bid)
+            if not self._finish_adjustment_delete(bid, node_id):
+                self.check_block_health(bid)
         elif etype == "doc_synced":
             self.log_event("DEBUG", "sync", "doc_synced",
                            event.get("doc", ""), "system",
@@ -542,11 +552,12 @@ class NameNode:
             self.check_block_health(bid)
 
     def _recovery_loop(self):
-        """周期扫描恢复队列：为缺副本的块安排 源->目标 复制命令。"""
+        """周期扫描：缺副本先补齐，再修复跨机架分布违规。"""
         while not self._stop.is_set():
             self._stop.wait(config.RECOVERY_SCAN_INTERVAL)
             try:
                 self._schedule_recovery_once()
+                self._schedule_rack_rebalancing_once()
             except Exception as e:  # noqa: BLE001
                 self.log_event("ERROR", "recovery", "loop_error", "", "system",
                                str(e))
@@ -597,6 +608,9 @@ class NameNode:
                         del reps[nid]
                     self.meta.touch("blocks", flush=False)
             have = good_set
+            node_by_id = {n["node_id"]: n for n in live}
+            good_racks = {node_by_id[nid].get("rack") for nid in good
+                          if nid in node_by_id}
             candidates = [n for n in live
                           if n["node_id"] not in have
                           and n.get("storage", {}).get("free", 0)
@@ -606,7 +620,8 @@ class NameNode:
             need = desired - len(good)
             src = random.choice(good)
             targets = self._rank_targets(candidates, blk.get("size", 0),
-                                         count=need)
+                                         count=need,
+                                         occupied_racks=good_racks)
             src_url = self._node_url(src)
             for tnode in targets:
                 cmd = {"type": "replicate", "block_id": bid, "src": src_url,
@@ -624,6 +639,210 @@ class NameNode:
                       f"块 {short_hash(bid, 12)} 恢复调度: {src} -> "
                       f"{','.join(t['node_id'] for t in targets)}",
                       block=bid, src=src)
+
+    def _block_rack_layout(self, blk, live_nodes):
+        """返回块在各存活机架上的好副本分布，以及存活好副本节点。"""
+        live_ids = {n["node_id"] for n in live_nodes}
+        racks = {}
+        good = []
+        for nid, rep in (blk.get("replicas") or {}).items():
+            if nid not in live_ids or rep.get("state") != "ok" or \
+                    rep.get("genstamp", 0) != blk.get("genstamp", 0):
+                continue
+            good.append(nid)
+        node_by_id = {n["node_id"]: n for n in live_nodes}
+        for nid in good:
+            rack = (node_by_id.get(nid) or {}).get("rack")
+            racks.setdefault(rack, []).append(nid)
+        return racks, good
+
+    def _rack_violation(self, blk, live_nodes, racks=None, good=None):
+        """满副本但副本没有尽可能分散到不同机架时返回违规说明。"""
+        if racks is None or good is None:
+            racks, good = self._block_rack_layout(blk, live_nodes)
+        desired = int(blk.get("desired", config.DEFAULT_REPLICATION)
+                      or config.DEFAULT_REPLICATION)
+        if len(good) < desired:
+            return None
+        wanted = min(desired, len({n.get("rack") for n in live_nodes}))
+        if len(racks) >= wanted:
+            return None
+        return {"needed_racks": wanted, "actual_racks": len(racks),
+                "racks": {str(k): len(v) for k, v in racks.items()}}
+
+    def _schedule_rack_rebalancing_once(self):
+        """
+        持续修复满副本但跨机架分布不合法的块。
+
+        原则：先复制到新机架并确认成功，再删除旧机架上的副本；在副本数
+        超过 desired 时，也可直接删除会改善机架分散度的多余副本。
+        """
+        live = self.live_nodes()
+        if not live:
+            return
+        with self.meta.lock:
+            blocks = list(self.meta.get("blocks")["blocks"].items())
+
+        for bid, blk in blocks:
+            with self.health_lock:
+                active = self.rack_adjustments.get(bid)
+                if active and now() - active["at"] < config.REPLICATION_TIMEOUT:
+                    continue
+                stale = active
+            if stale and stale.get("phase") == "cleanup":
+                with self.meta.lock:
+                    cur = self.meta.get("blocks")["blocks"].get(bid)
+                    src_present = bool(
+                        cur and stale.get("src") in (cur.get("replicas") or {}))
+                if src_present:
+                    self._enqueue_command(stale["src"], {
+                        "type": "delete", "block_id": bid,
+                        "reason": "跨机架再均衡清理命令超时，重试删除源副本"})
+                    with self.health_lock:
+                        stale["at"] = now()
+                        self.rack_adjustments[bid] = stale
+                    continue
+                with self.health_lock:
+                    self.rack_adjustments.pop(bid, None)
+            elif stale:
+                # 复制命令丢失/失败但没有收到事件：丢弃本次尝试，下一轮重新选点。
+                with self.health_lock:
+                    self.rack_adjustments.pop(bid, None)
+            rack_counts, good = self._block_rack_layout(blk, live)
+            desired = int(blk.get("desired", config.DEFAULT_REPLICATION)
+                          or config.DEFAULT_REPLICATION)
+            if len(good) < desired:
+                continue
+
+            if len(good) > desired:
+                self._delete_surplus_for_rack_spread(bid, blk, live, good,
+                                                      rack_counts, desired)
+                continue
+
+            if not self._rack_violation(blk, live, rack_counts, good):
+                continue
+            candidates = [n for n in live
+                          if n["node_id"] not in set(good)
+                          and n.get("storage", {}).get("free", 0)
+                          > blk.get("size", 0)]
+            if not candidates:
+                continue
+            occupied = set(rack_counts.keys())
+            targets = self._rank_targets(candidates, blk.get("size", 0), 1,
+                                         occupied_racks=occupied)
+            target = targets[0]
+            if target.get("rack") in occupied:
+                continue
+            source_rack = max(rack_counts, key=lambda r: len(rack_counts[r]))
+            src = random.choice(rack_counts[source_rack])
+            migration_id = gen_id("rmig")
+            cmd = {"type": "replicate", "block_id": bid,
+                   "src": self._node_url(src),
+                   "genstamp": blk.get("genstamp", 1),
+                   "checksum": blk.get("checksum"),
+                   "size": blk.get("size"), "migration_id": migration_id}
+            self._enqueue_command(target["node_id"], cmd)
+            with self.health_lock:
+                self.rack_adjustments[bid] = {
+                    "id": migration_id, "src": src, "dst": target["node_id"],
+                    "phase": "copy", "at": now()}
+            self.emit("recovery_scheduled",
+                      f"块 {short_hash(bid, 12)} 机架再均衡: {src} -> "
+                      f"{target['node_id']} ({source_rack} -> {target.get('rack')})",
+                      block=bid, src=src)
+
+    def _delete_surplus_for_rack_spread(self, bid, blk, live_nodes, good,
+                                        rack_counts, desired):
+        """删除超副本，且优先删除最拥挤机架上的副本，使机架分布尽快摊开。"""
+        surplus = len(good) - desired
+        if surplus <= 0:
+            return 0
+        node_by_id = {n["node_id"]: n for n in live_nodes}
+        removable = sorted(
+            good,
+            key=lambda nid: (
+                -len(rack_counts.get(node_by_id[nid].get("rack"), [])),
+                nid))
+        removed = 0
+        for nid in removable:
+            if removed >= surplus:
+                break
+            rack = node_by_id[nid].get("rack")
+            with self.meta.lock:
+                cur = self.meta.get("blocks")["blocks"].get(bid)
+                if cur and nid in (cur.get("replicas") or {}):
+                    del cur["replicas"][nid]
+                    self.meta.touch("blocks", flush=False)
+            self._enqueue_command(nid, {
+                "type": "delete", "block_id": bid,
+                "reason": "删除超出期望的多余副本，优先摊开机架分布"})
+            rack_counts.setdefault(rack, []).remove(nid)
+            if not rack_counts.get(rack):
+                rack_counts.pop(rack, None)
+            good.remove(nid)
+            removed += 1
+        if removed:
+            self.emit("recovery_scheduled",
+                      f"块 {short_hash(bid, 12)} 删除 {removed} 个超量副本以改善机架分布",
+                      block=bid)
+        return removed
+
+    def _finish_adjustment_copy(self, bid, node_id, migration_id=None):
+        """机架再均衡副本复制成功：保留新副本，并删除源机架旧副本。"""
+        with self.health_lock:
+            adj = self.rack_adjustments.get(bid)
+            if not adj or (migration_id and adj.get("id") != migration_id):
+                return False
+            if adj.get("dst") != node_id or adj.get("phase") != "copy":
+                return False
+            src = adj["src"]
+            dst = adj["dst"]
+            adj_id = adj["id"]
+
+        with self.meta.lock:
+            blk = self.meta.get("blocks")["blocks"].get(bid)
+            src_present = bool(blk and src in (blk.get("replicas") or {}))
+            if src_present:
+                del blk["replicas"][src]
+                self.meta.touch("blocks", flush=False)
+        if src_present:
+            self._enqueue_command(src, {
+                "type": "delete", "block_id": bid,
+                "reason": "跨机架再均衡：新副本确认后删除原机架副本"})
+        with self.health_lock:
+            current = self.rack_adjustments.get(bid)
+            if current and current.get("id") == adj_id and \
+                    current.get("dst") == dst:
+                self.rack_adjustments[bid]["phase"] = "cleanup"
+                self.rack_adjustments[bid]["at"] = now()
+        self.emit("recovery_scheduled",
+                  f"块 {short_hash(bid, 12)} 机架再均衡新副本已确认，清理 {src}",
+                  block=bid, src=src)
+        return True
+
+    def _fail_adjustment_copy(self, bid, node_id, migration_id=None, reason=""):
+        with self.health_lock:
+            adj = self.rack_adjustments.get(bid)
+            if not adj or (migration_id and adj.get("id") != migration_id):
+                return False
+            if adj.get("dst") != node_id or adj.get("phase") != "copy":
+                return False
+            self.rack_adjustments.pop(bid, None)
+        self.log_event("WARN", "recovery", "rack_rebalance_failed",
+                       bid or "", "system",
+                       f"{node_id}: {reason}")
+        return True
+
+    def _finish_adjustment_delete(self, bid, node_id):
+        with self.health_lock:
+            adj = self.rack_adjustments.get(bid)
+            if not adj or adj.get("src") != node_id or \
+                    adj.get("phase") != "cleanup":
+                return False
+            self.rack_adjustments.pop(bid, None)
+        self.emit("recovery_scheduled",
+                  f"块 {short_hash(bid, 12)} 跨机架再均衡完成", block=bid)
+        return True
 
     def _enqueue_command(self, node_id, cmd):
         with self.cmd_lock:
@@ -683,7 +902,7 @@ class NameNode:
             n = self.nodes.get(node_id)
         return (n or {}).get("url", "")
 
-    def _rank_targets(self, candidates, size, count):
+    def _rank_targets(self, candidates, size, count, occupied_racks=()):
         """跨机架优先 + 剩余空间优先 + 少量随机扰动。"""
         def score(n):
             free = n.get("storage", {}).get("free", 0)
@@ -691,18 +910,21 @@ class NameNode:
             usage = 1 - (free / cap)
             return (usage + random.random() * 0.05, n.get("rack"))
         ranked = sorted(candidates, key=score)
-        chosen, racks = [], set()
-        for n in ranked:                       # 第一轮：机架去重
+        occupied = set(occupied_racks)
+        chosen, racks = [], set(occupied)
+        for n in ranked:                       # 第一轮：避开已有副本机架，再做机架去重
             if len(chosen) >= count:
                 break
-            if n.get("rack") not in racks:
+            rack = n.get("rack")
+            if rack not in racks:
                 chosen.append(n)
-                racks.add(n.get("rack"))
-        for n in ranked:                       # 第二轮：机架不够再补
+                racks.add(rack)
+        for n in ranked:                       # 第二轮：可用机架不足时允许同机架补齐
             if len(chosen) >= count:
                 break
             if n not in chosen:
                 chosen.append(n)
+                racks.add(n.get("rack"))
         return chosen
 
     def choose_targets(self, size, count=None, exclude=()):
@@ -1271,6 +1493,8 @@ class NameNode:
             nodes = list(self.nodes.values())
         total_cap = sum(n.get("storage", {}).get("capacity", 0) for n in nodes)
         total_used = sum(n.get("storage", {}).get("used", 0) for n in nodes)
+        live_nodes = [n for n in nodes if n["state"] == "LIVE"]
+        rack_violations = self._rack_violation_count(blocks, live_nodes)
         rep_dist = {}
         size_hist = {}
         for blk in blocks:
@@ -1296,6 +1520,7 @@ class NameNode:
             "nodes_live": sum(1 for n in nodes if n["state"] == "LIVE"),
             "nodes_dead": sum(1 for n in nodes if n["state"] == "DEAD"),
             "under_replicated": under,
+            "rack_violations": rack_violations,
             "corrupt_replicas": corrupt,
             "missing_blocks": missing,
             "ext_bytes": fs_stats["ext_bytes"],
@@ -1362,6 +1587,15 @@ class NameNode:
     # ==================================================================
     # 节点视图 / 演练
     # ==================================================================
+    def _rack_violation_count(self, blocks=None, live=None):
+        live = live if live is not None else self.live_nodes()
+        if blocks is None:
+            with self.meta.lock:
+                blocks = list(self.meta.get("blocks")["blocks"].values())
+        return sum(1 for blk in blocks
+                   if self._rack_violation(blk, live,
+                                          *self._block_rack_layout(blk, live)))
+
     def nodes_view(self):
         with self.node_lock:
             nodes = [dict(n) for n in self.nodes.values()]
@@ -1370,6 +1604,8 @@ class NameNode:
         per_node_corrupt = {n["node_id"]: 0 for n in nodes}
         with self.meta.lock:
             blocks = list(self.meta.get("blocks")["blocks"].values())
+        rack_violations = self._rack_violation_count(
+            blocks, [n for n in nodes if n.get("state") == "LIVE"])
         for blk in blocks:
             for nid, rep in list((blk.get("replicas") or {}).items()):
                 if nid in per_node_blocks:
@@ -1403,6 +1639,8 @@ class NameNode:
                 "under_replicated": len(self.under_replicated),
                 "corrupt_replicas": len(self.corrupt_replicas),
                 "missing_blocks": len(self.missing_blocks),
+                "rack_violations": rack_violations,
+                "rack_adjusting": len(self.rack_adjustments),
                 "scheduled": len(self.scheduled),
             }
         return {"nodes": out, "health": health,
@@ -1437,10 +1675,12 @@ class NameNode:
         """块 x 节点 副本分布矩阵（节点页可视化）。"""
         with self.node_lock:
             node_ids = sorted(self.nodes.keys())
-            live_ids = {nid for nid, n in self.nodes.items()
-                        if n["state"] == "LIVE"}
+            live_nodes = [dict(n) for nid, n in sorted(self.nodes.items())
+                          if n["state"] == "LIVE"]
         with self.meta.lock:
             blocks = dict(self.meta.get("blocks")["blocks"])
+
+        live_ids = {n["node_id"] for n in live_nodes}
 
         def good_count(blk):
             n = 0
@@ -1453,7 +1693,11 @@ class NameNode:
         # 优先展示有问题的块
         def blk_score(bid_b):
             bid, blk = bid_b
+            racks, good = self._block_rack_layout(blk, live_nodes)
+            violation = self._rack_violation(blk, live_nodes, racks, good)
             return (good_count(blk) - blk.get("desired", 3),
+                    0 if violation else 1,
+                    -len(racks) if racks else 0,
                     -len(blk.get("replicas", {})))
 
         items = sorted(blocks.items(), key=blk_score)[:limit]
@@ -1472,13 +1716,19 @@ class NameNode:
                 else:
                     cells[nid] = "stale"
             live = good_count(blk)
+            racks, good_nodes = self._block_rack_layout(blk, live_nodes)
+            rack_violation = self._rack_violation(blk, live_nodes, racks,
+                                                  good_nodes)
+            status = ("missing" if live == 0 else
+                      "under" if live < blk.get("desired", 3)
+                      else "rack_violation" if rack_violation else "ok")
             rows.append({"block": bid, "short": short_hash(bid.replace("blk_", ""), 8),
                          "size": blk.get("size", 0),
                          "desired": blk.get("desired"),
                          "live": live, "cells": cells,
-                         "status": ("missing" if live == 0 else
-                                    "under" if live < blk.get("desired", 3)
-                                    else "ok")})
+                         "racks": {str(k): v for k, v in racks.items()},
+                         "rack_violation": rack_violation,
+                         "status": status})
         return {"nodes": node_ids, "rows": rows, "total_blocks": len(blocks)}
 
     def health_queue(self):
@@ -1488,6 +1738,7 @@ class NameNode:
                        in self.corrupt_replicas.items()}
             missing = set(self.missing_blocks)
             scheduled = dict(self.scheduled)
+            adjustments = dict(self.rack_adjustments)
         with self.meta.lock:
             blocks = self.meta.get("blocks")["blocks"]
             under_items = []
@@ -1500,9 +1751,34 @@ class NameNode:
                     "scheduled": scheduled.get(bid),
                     "size": blk.get("size", 0),
                 })
-        return {"under_replicated": under_items, "corrupt": corrupt,
+        live = self.live_nodes()
+        rack_items = []
+        with self.meta.lock:
+            snapshot = list(blocks.items())
+        for bid, blk in snapshot:
+            racks, good = self._block_rack_layout(blk, live)
+            violation = self._rack_violation(blk, live, racks, good)
+            if not violation:
+                continue
+            rack_items.append({
+                "block": bid, "desired": blk.get("desired"),
+                "live": len(good), "size": blk.get("size", 0),
+                "racks": {str(k): len(v) for k, v in racks.items()},
+                "adjustment": adjustments.get(bid),
+                **violation,
+            })
+        rack_items = rack_items[:80]
+        return {"under_replicated": under_items,
+                "rack_violations": rack_items, "corrupt": corrupt,
                 "missing": sorted(missing)[:80],
-                "counts": {"under": len(under), "corrupt": len(corrupt),
+                "counts": {"under": len(under),
+                           "rack_violations": sum(
+                               1 for _, blk in snapshot
+                               if self._rack_violation(
+                                   blk, live,
+                                   *self._block_rack_layout(blk, live))),
+                           "rack_adjusting": len(adjustments),
+                           "corrupt": len(corrupt),
                            "missing": len(missing),
                            "scheduled": len(scheduled)}}
 
